@@ -1,0 +1,15 @@
+timezone: America/New_York
+
+market_hours:
+  start: "09:30"
+  end: "16:00"
+
+stocks:
+  - symbol: NVDA
+    dollar_drop_threshold: 10
+
+  - symbol: MU
+    dollar_drop_threshold: 10
+
+  - symbol: AVGO
+    dollar_drop_threshold: 10
