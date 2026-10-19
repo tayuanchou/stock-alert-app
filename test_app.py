@@ -6,17 +6,18 @@ Run:  python -m unittest -v
 import json
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import app
 
 
 class CheckStockTests(unittest.TestCase):
-    """Each case patches price fetching and Twilio so no network is touched."""
+    """Each case patches price fetching and Telegram so no network is touched."""
 
     def setUp(self):
         self.sent = []
-        patcher = patch.object(app, "send_whatsapp_message", self.sent.append)
+        patcher = patch.object(app, "send_telegram_message", self.sent.append)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.today = app.today_str(app.load_config())
@@ -96,7 +97,7 @@ class MainTests(unittest.TestCase):
         ), patch.object(
             app, "get_price_info", fake_get_price_info
         ), patch.object(
-            app, "send_whatsapp_message", lambda _message: None
+            app, "send_telegram_message", lambda _message: None
         ):
             app.main()
 
@@ -179,21 +180,115 @@ class MessageFormatTests(unittest.TestCase):
         )
 
 
-class SendWhatsAppTests(unittest.TestCase):
+class SendTelegramTests(unittest.TestCase):
+    """Transport tests. requests.post is always stubbed, so nothing is sent."""
+
+    CREDS = {"TELEGRAM_BOT_TOKEN": "123:SECRET", "TELEGRAM_CHAT_ID": "456"}
+
     def test_missing_credentials_raise_a_clear_error(self):
         with patch.dict(
             app.os.environ,
-            {
-                "TWILIO_ACCOUNT_SID": "",
-                "TWILIO_AUTH_TOKEN": "",
-                "TWILIO_WHATSAPP_FROM": "",
-                "MY_WHATSAPP_TO": "",
-            },
+            {"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": ""},
             clear=False,
         ):
             with self.assertRaises(RuntimeError) as ctx:
-                app.send_whatsapp_message("hello")
-        self.assertIn("TWILIO_ACCOUNT_SID", str(ctx.exception))
+                app.send_telegram_message("hello")
+        self.assertIn("TELEGRAM_BOT_TOKEN", str(ctx.exception))
+
+    def test_posts_to_sendmessage_and_returns_message_id(self):
+        captured = {}
+
+        def fake_post(url, json=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            captured["timeout"] = timeout
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {"ok": True, "result": {"message_id": 42}},
+            )
+
+        with patch.dict(app.os.environ, self.CREDS, clear=False), patch.object(
+            app.requests, "post", fake_post
+        ):
+            message_id = app.send_telegram_message("hello")
+
+        self.assertEqual(message_id, 42)
+        self.assertEqual(
+            captured["url"], "https://api.telegram.org/bot123:SECRET/sendMessage"
+        )
+        self.assertEqual(captured["json"], {"chat_id": "456", "text": "hello"})
+        self.assertEqual(captured["timeout"], app.TELEGRAM_TIMEOUT_SECONDS)
+
+    def test_api_rejection_raises_with_the_description(self):
+        def fake_post(url, json=None, timeout=None):
+            return SimpleNamespace(
+                status_code=400,
+                json=lambda: {
+                    "ok": False,
+                    "error_code": 400,
+                    "description": "chat not found",
+                },
+            )
+
+        with patch.dict(app.os.environ, self.CREDS, clear=False), patch.object(
+            app.requests, "post", fake_post
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                app.send_telegram_message("hello")
+        self.assertIn("chat not found", str(ctx.exception))
+
+    def test_network_failure_does_not_leak_the_token(self):
+        def fake_post(url, json=None, timeout=None):
+            # requests puts the full URL - token included - in its own messages.
+            raise app.requests.ConnectionError(f"failed connecting to {url}")
+
+        with patch.dict(app.os.environ, self.CREDS, clear=False), patch.object(
+            app.requests, "post", fake_post
+        ), patch.object(app, "sleep", lambda _s: None):
+            with self.assertRaises(RuntimeError) as ctx:
+                app.send_telegram_message("hello")
+        text = str(ctx.exception)
+        self.assertNotIn("SECRET", text)
+        self.assertNotIn("api.telegram.org", text)
+        self.assertIn("ConnectionError", text)
+
+    def test_transient_failure_is_retried_then_succeeds(self):
+        calls = []
+
+        def fake_post(url, json=None, timeout=None):
+            calls.append(timeout)
+            if len(calls) < 3:
+                raise app.requests.ReadTimeout("timed out")
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {"ok": True, "result": {"message_id": 7}},
+            )
+
+        with patch.dict(app.os.environ, self.CREDS, clear=False), patch.object(
+            app.requests, "post", fake_post
+        ), patch.object(app, "sleep", lambda _s: None):
+            self.assertEqual(app.send_telegram_message("hello"), 7)
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls, [app.TELEGRAM_TIMEOUT_SECONDS] * 3)
+
+    def test_api_rejection_is_not_retried(self):
+        calls = []
+
+        def fake_post(url, json=None, timeout=None):
+            calls.append(1)
+            return SimpleNamespace(
+                status_code=400,
+                json=lambda: {"ok": False, "error_code": 400, "description": "nope"},
+            )
+
+        with patch.dict(app.os.environ, self.CREDS, clear=False), patch.object(
+            app.requests, "post", fake_post
+        ), patch.object(app, "sleep", lambda _s: None):
+            with self.assertRaises(RuntimeError):
+                app.send_telegram_message("hello")
+
+        self.assertEqual(len(calls), 1, "a deterministic rejection must not retry")
 
 
 if __name__ == "__main__":

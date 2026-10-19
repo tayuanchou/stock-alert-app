@@ -1,8 +1,8 @@
-"""Stock drop WhatsApp alerter (V1).
+"""Stock drop Telegram alerter (V1).
 
-Checks each configured stock against yesterday's close and sends a WhatsApp
-message through Twilio when the drop meets or exceeds the configured dollar
-threshold. At most one alert per stock per trading day.
+Checks each configured stock against yesterday's close and sends a Telegram
+message when the drop meets or exceeds the configured dollar threshold.
+At most one alert per stock per trading day.
 
 Run manually:  python app.py
 """
@@ -12,28 +12,35 @@ import os
 from datetime import datetime, time
 from functools import lru_cache
 from pathlib import Path
+from time import sleep
+from typing import Any
 from zoneinfo import ZoneInfo
 
+import requests
 import yaml
 import yfinance as yf
 from dotenv import load_dotenv
-from twilio.rest import Client
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 STATE_PATH = BASE_DIR / "alert_state.json"
 
+# This connection has been observed taking 20s+ for a Telegram round trip, so
+# the timeout is generous and transient network errors are retried.
+TELEGRAM_TIMEOUT_SECONDS = 30
+TELEGRAM_ATTEMPTS = 3
+
 load_dotenv(BASE_DIR / ".env")
 
 
 @lru_cache(maxsize=1)
-def load_config():
+def load_config() -> dict[str, Any]:
     """Read config.yaml and return it as a dict. Cached per process."""
     with open(CONFIG_PATH, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
 
 
-def load_state():
+def load_state() -> dict[str, str]:
     """Read alert_state.json. Returns {} if it is missing or unreadable."""
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
@@ -41,29 +48,30 @@ def load_state():
     except FileNotFoundError:
         return {}
     except (json.JSONDecodeError, OSError) as exc:
-        print(f"Warning: could not read {STATE_PATH.name} ({exc}); starting empty")
+        print(
+            f"Warning: could not read {STATE_PATH.name} ({exc}); starting empty")
         return {}
     return state if isinstance(state, dict) else {}
 
 
-def save_state(state):
+def save_state(state: dict[str, str]) -> None:
     """Write the state dict to alert_state.json."""
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, sort_keys=True)
         f.write("\n")
 
 
-def market_timezone(config):
+def market_timezone(config: dict[str, Any]) -> ZoneInfo:
     """ZoneInfo for the configured market timezone."""
     return ZoneInfo(config.get("timezone", "America/New_York"))
 
 
-def today_str(config):
+def today_str(config: dict[str, Any]) -> str:
     """Today's date in market timezone as YYYY-MM-DD."""
     return datetime.now(market_timezone(config)).strftime("%Y-%m-%d")
 
 
-def is_market_open(config):
+def is_market_open(config: dict[str, Any]) -> bool:
     """True when the current market-timezone time is within regular hours.
 
     Weekends are excluded. U.S. market holidays are ignored in V1.
@@ -78,7 +86,7 @@ def is_market_open(config):
     return start <= now.time() <= end
 
 
-def get_price_info(symbol):
+def get_price_info(symbol: str) -> tuple[float, float]:
     """Return (current_price, previous_close) for a symbol.
 
     Previous close is taken from the most recent completed daily bar, so it
@@ -108,7 +116,7 @@ def get_price_info(symbol):
     return current_price, previous_close
 
 
-def _latest_price(ticker):
+def _latest_price(ticker: yf.Ticker) -> float | None:
     """Best-effort intraday price, or None if unavailable."""
     try:
         price = ticker.fast_info["last_price"]
@@ -117,53 +125,89 @@ def _latest_price(ticker):
     return float(price) if price else None
 
 
-def should_send_alert(symbol, state):
+def should_send_alert(symbol: str, state: dict[str, str]) -> bool:
     """True when no alert has been sent for this symbol today."""
     return state.get(symbol) != today_str(load_config())
 
 
-def mark_alert_sent(symbol, state):
+def mark_alert_sent(symbol: str, state: dict[str, str]) -> None:
     """Record today's date for the symbol in the state dict."""
     state[symbol] = today_str(load_config())
 
 
-def format_alert(symbol, current_price, previous_close, drop, threshold):
-    """Build the WhatsApp message body."""
+def format_alert(
+    symbol: str,
+    current_price: float,
+    previous_close: float,
+    drop: float,
+    threshold: float,
+) -> str:
+    """Build the alert message body."""
     return (
         f"Stock Alert: {symbol} dropped ${abs(drop):.2f} today.\n\n"
         f"Previous close: ${previous_close:.2f}\n"
         f"Current price: ${current_price:.2f}\n"
-        f"Threshold: ${float(threshold):.2f}\n\n"
+        f"Threshold: ${threshold:.2f}\n\n"
         "Check the market before making any decision."
     )
 
 
-def send_whatsapp_message(message):
-    """Send a WhatsApp message through Twilio."""
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    from_number = os.getenv("TWILIO_WHATSAPP_FROM")
-    to_number = os.getenv("MY_WHATSAPP_TO")
+def send_telegram_message(message: str) -> int:
+    """Send a message through the Telegram Bot API. Returns the message_id.
 
-    missing = [
-        name
-        for name, value in (
-            ("TWILIO_ACCOUNT_SID", account_sid),
-            ("TWILIO_AUTH_TOKEN", auth_token),
-            ("TWILIO_WHATSAPP_FROM", from_number),
-            ("MY_WHATSAPP_TO", to_number),
-        )
-        if not value
-    ]
+    Errors never include the request URL, because the bot token is embedded in
+    it and callers print exceptions to the log.
+    """
+    required = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+    env: dict[str, str] = {}
+    missing: list[str] = []
+    for name in required:
+        value = os.getenv(name)
+        if value:
+            env[name] = value
+        else:
+            missing.append(name)
     if missing:
-        raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
+        raise RuntimeError(
+            f"Missing environment variables: {', '.join(missing)}")
 
-    client = Client(account_sid, auth_token)
-    sent = client.messages.create(body=message, from_=from_number, to=to_number)
-    return sent.sid
+    url = f"https://api.telegram.org/bot{env['TELEGRAM_BOT_TOKEN']}/sendMessage"
+    payload_out = {"chat_id": env["TELEGRAM_CHAT_ID"], "text": message}
+
+    last_error = ""
+    for attempt in range(1, TELEGRAM_ATTEMPTS + 1):
+        try:
+            response = requests.post(
+                url, json=payload_out, timeout=TELEGRAM_TIMEOUT_SECONDS
+            )
+            break
+        except requests.RequestException as exc:
+            last_error = type(exc).__name__
+            if attempt < TELEGRAM_ATTEMPTS:
+                print(
+                    f"Telegram {last_error}, retrying ({attempt}/{TELEGRAM_ATTEMPTS})")
+                sleep(2 * attempt)
+    else:
+        raise RuntimeError(
+            f"Telegram request failed after {TELEGRAM_ATTEMPTS} attempts: {last_error}"
+        ) from None
+
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RuntimeError(
+            f"Telegram returned a non-JSON response (HTTP {response.status_code})"
+        ) from None
+
+    if not payload.get("ok"):
+        raise RuntimeError(
+            f"Telegram API error {payload.get('error_code')}: "
+            f"{payload.get('description')}"
+        )
+    return int(payload["result"]["message_id"])
 
 
-def check_stock(stock, state):
+def check_stock(stock: dict[str, Any], state: dict[str, str]) -> bool:
     """Check one stock and alert if it dropped past its threshold.
 
     Returns True if an alert was sent.
@@ -183,19 +227,26 @@ def check_stock(stock, state):
         print("No alert needed")
         return False
 
+    print(
+        f"QUALIFIED: {symbol} dropped ${abs(drop):.2f}, "
+        f"at or beyond its ${threshold:.2f} threshold"
+    )
+
     if not should_send_alert(symbol, state):
         print(f"Alert already sent today for {symbol}")
         return False
 
-    send_whatsapp_message(
-        format_alert(symbol, current_price, previous_close, drop, threshold)
-    )
+    message = format_alert(symbol, current_price,
+                           previous_close, drop, threshold)
+    print("Message body:")
+    print(message)
+    send_telegram_message(message)
     mark_alert_sent(symbol, state)
     print(f"Alert sent for {symbol}")
     return True
 
 
-def main():
+def main() -> None:
     config = load_config()
     state = load_state()
 
