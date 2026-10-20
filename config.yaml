@@ -13,3 +13,10 @@ stocks:
 
   - symbol: AVGO
     dollar_drop_threshold: 10
+
+  # --- TEST HARNESS: remove before scheduling for real ---
+  # A negative threshold makes the `drop <= -threshold` check always true, so
+  # this entry fires an alert on every run regardless of the actual price move.
+  # SPY is used because it is liquid and always returns price data.
+  - symbol: SPY
+    dollar_drop_threshold: -1000000

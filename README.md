@@ -1,6 +1,6 @@
-# Stock Drop WhatsApp Alerts (V1)
+# Stock Drop Telegram Alerts (V1)
 
-Sends you a WhatsApp message when a configured stock drops more than a set dollar
+Sends you a Telegram message when a configured stock drops more than a set dollar
 amount from the previous trading day's close. At most one alert per stock per day.
 
 ## Setup
@@ -12,7 +12,7 @@ venv\Scripts\activate          # Windows
 pip install -r requirements.txt
 ```
 
-Copy the environment template and fill in your Twilio credentials:
+Copy the environment template and fill in your Telegram credentials:
 
 ```bash
 copy .env.example .env         # Windows
@@ -20,23 +20,30 @@ copy .env.example .env         # Windows
 ```
 
 ```bash
-TWILIO_ACCOUNT_SID=your_twilio_account_sid
-TWILIO_AUTH_TOKEN=your_twilio_auth_token
-TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
-MY_WHATSAPP_TO=whatsapp:+1YOUR_PHONE_NUMBER
+TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
+TELEGRAM_CHAT_ID=your_numeric_chat_id
 ```
 
-`TWILIO_WHATSAPP_FROM` is the Twilio WhatsApp sender (the number above is
-Twilio's shared sandbox sender). `MY_WHATSAPP_TO` is your own WhatsApp number.
+### Creating the Telegram bot
 
-### Twilio WhatsApp sandbox
+1. In Telegram, open [@BotFather](https://t.me/botfather) and send `/newbot`.
+2. Give it a display name (anything, e.g. `Peter Stock Alerts`).
+3. Give it a username — 5–32 characters, letters/digits/underscores only, and it
+   **must end in `bot`** (e.g. `peter_stock_alert_bot`). This cannot be changed
+   later.
+4. BotFather replies with a token shaped like
+   `110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw`. That is
+   `TELEGRAM_BOT_TOKEN`. Treat it as a password — anyone holding it controls the
+   bot. `/token` reissues it if it leaks.
+5. Open `https://t.me/<your_bot_username>` and tap **Start**. This is required:
+   a bot cannot message anyone who has not first started a conversation with it.
+6. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and read
+   the integer at `result[0].message.chat.id`. That is `TELEGRAM_CHAT_ID`. If
+   `result` is empty, step 5 did not register — send the bot any message and
+   reload.
 
-For personal use, the sandbox is enough. In the Twilio Console go to
-**Messaging → Try it out → Send a WhatsApp message**, then send the join code it
-shows you (e.g. `join <two-words>`) from your phone to the sandbox number. The
-sandbox session expires after 72 hours of inactivity — re-send the join code to
-renew it. To send outside a 24-hour conversation window you need an approved
-template or a production WhatsApp sender.
+Unlike WhatsApp, Telegram has no session window, no message templates, and no
+approval process, so a scheduled job can send at any time without preconditions.
 
 ## Configure the watchlist
 
@@ -96,8 +103,9 @@ python -m unittest -v
 ```
 
 Covers all five example cases from the spec plus market-hours boundaries, state
-round-tripping, and message formatting. No network calls — price fetching and
-Twilio are both stubbed.
+round-tripping, message formatting, and the Telegram transport (including that a
+network failure never leaks the bot token into the log). No network calls —
+price fetching and `requests.post` are both stubbed.
 
 ## Scheduling every 15 minutes
 
@@ -137,3 +145,4 @@ gitignored because it is per-machine runtime state, not configuration.
   no new bar, and simply report no drop.
 - `yfinance` is an unofficial feed, quotes may lag by up to ~15 minutes.
 - Dollar drops only; percentage thresholds are a V2 item.
+- The bot can only message a chat that has pressed **Start** on it.
